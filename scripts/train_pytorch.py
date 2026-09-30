@@ -40,6 +40,23 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+
+def _musa_available():
+    musa = getattr(torch, "musa", None)
+    return musa is not None and musa.is_available()
+
+
+def _accelerator_type():
+    if torch.cuda.is_available():
+        return "cuda"
+    if _musa_available():
+        return "musa"
+    return "cpu"
+
+
+def _accelerator_device(index=0):
+    return torch.device(f"{_accelerator_type()}:{index}" if _accelerator_type() != "cpu" else "cpu")
+
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
@@ -94,18 +111,20 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = _accelerator_device(local_rank)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    elif device.type == "musa":
+        torch.musa.set_device(device.index)
+
     if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        backend = {"cuda": "nccl", "musa": "mccl"}.get(_accelerator_type(), "gloo")
         torch.distributed.init_process_group(backend=backend, init_method="env://")
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
     return use_ddp, local_rank, device
 
 
@@ -120,6 +139,8 @@ def set_seed(seed: int, local_rank: int):
     np.random.seed(seed + local_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed + local_rank)
+    elif _musa_available():
+        torch.musa.manual_seed_all(seed + local_rank)
 
 
 def build_datasets(config: _config.TrainConfig):
@@ -152,7 +173,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         return
 
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps:
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -221,7 +242,14 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            if device.type == "musa":
+                state_dict = safetensors.torch.load_file(str(safetensors_path), device="cpu")
+                missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+                del state_dict
+                if missing or unexpected:
+                    logging.warning(f"MUSA checkpoint load non-strict: missing={missing}, unexpected={unexpected}")
+            else:
+                safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -422,9 +450,10 @@ def train_loop(config: _config.TrainConfig):
 
     # Enable memory optimizations for large-scale training
     if world_size >= 8:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
@@ -443,9 +472,16 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        target_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        if device.type == "musa":
+            # safetensors_rust does not recognize MUSA device strings; load on CPU then copy.
+            state_dict = safetensors.torch.load_file(model_path, device="cpu")
+            missing, unexpected = target_model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                logging.warning(f"MUSA weight load non-strict: missing={missing}, unexpected={unexpected}")
+            del state_dict
+        else:
+            safetensors.torch.load_model(target_model, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
@@ -453,6 +489,22 @@ def train_loop(config: _config.TrainConfig):
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
+
+    # The PyTorch trainer performs full-parameter fine-tuning: every model
+    # parameter is passed to AdamW and no JAX/NNX freeze_filter is applied.
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    if is_main:
+        logging.info(
+            "Parameter summary: total=%d trainable=%d trainable_ratio=%.6f",
+            total_params,
+            trainable_params,
+            trainable_params / max(total_params, 1),
+        )
+    if trainable_params != total_params:
+        raise RuntimeError(
+            f"Full-parameter training requested but only {trainable_params}/{total_params} parameters are trainable"
+        )
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(

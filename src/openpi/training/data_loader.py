@@ -1,13 +1,17 @@
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
+import pathlib
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+try:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+except ImportError:
+    from lerobot.datasets import lerobot_dataset
 import numpy as np
 import torch
 
@@ -137,13 +141,22 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    # Newer LeRobot exposes the dataset under lerobot.datasets and accepts a
+    # local dataset root separately from its repo identifier.
+    local_root = pathlib.Path(repo_id) if pathlib.Path(repo_id).exists() else None
+    dataset_id = local_root.name if local_root is not None else repo_id
+    metadata_kwargs = {"root": local_root} if local_root is not None else {}
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(dataset_id, **metadata_kwargs)
+    dataset_kwargs = {
+        # PyAV works with the container FFmpeg stack; torchcodec is not compatible with this MUSA image.
+        "video_backend": "pyav",
+        "delta_timestamps": {
+            ("action" if key == "actions" else key): [t / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
         },
-    )
+        **metadata_kwargs,
+    }
+    dataset = lerobot_dataset.LeRobotDataset(dataset_id, **dataset_kwargs)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

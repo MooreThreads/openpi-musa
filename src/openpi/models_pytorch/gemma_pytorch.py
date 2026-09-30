@@ -1,7 +1,10 @@
 from typing import Literal
+import os
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
@@ -196,15 +199,23 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                # Attention computation with optional native MUSA Flash SDPA.
+                use_musa_flash = os.environ.get("OPENPI_USE_MUSA_FLASH", "0") == "1" and query_states.device.type == "musa" and query_states.shape[-1] in {64, 128}
+                if os.environ.get("OPENPI_USE_MUSA_FLASH", "0") == "1" and query_states.device.type == "musa" and query_states.shape[-1] not in {64, 128}:
+                    if layer_idx == 0:
+                        import warnings
+                        warnings.warn(f"MUSA Flash SDPA does not support head_dim={query_states.shape[-1]}; falling back to eager attention")
+                if use_musa_flash:
+                    attn_module = self.paligemma.language_model.layers[layer_idx].self_attn
+                    key_states = modeling_gemma.repeat_kv(key_states, attn_module.num_key_value_groups)
+                    value_states = modeling_gemma.repeat_kv(value_states, attn_module.num_key_value_groups)
+                    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                        att_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0, is_causal=False, scale=scaling).transpose(1, 2).contiguous()
+                else:
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states, key_states, value_states, attention_mask, scaling,
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+NODE_RANK="${NODE_RANK:?set NODE_RANK=0 on 143 or NODE_RANK=1 on 168}"
+MASTER_ADDR="${MASTER_ADDR:-10.12.11.143}"
+MASTER_PORT="${MASTER_PORT:-29555}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NNODES="${NNODES:-2}"
+EXP_NAME="${EXP_NAME:-musa_pi05_2node_1000}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-1000}"
+LOG_INTERVAL="${LOG_INTERVAL:-10}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
+PROJECT_ROOT="/workspace/openpi"
+DATASET="${DATASET:-/data01e_biaozhun/fastwam/datasets/libero_mujoco3.3.2/libero_10_no_noops_lerobot}"
+ASSETS_DIR="${ASSETS_DIR:-$PROJECT_ROOT/assets/pi05_libero}"
+ASSET_ID="${ASSET_ID:-libero_10_no_noops_lerobot}"
+WEIGHT_PATH="${WEIGHT_PATH:-$PROJECT_ROOT/checkpoints/pi05_base_pytorch}"
+CHECKPOINT_BASE_DIR="${CHECKPOINT_BASE_DIR:-$PROJECT_ROOT/runs/2node}"
+mkdir -p "$CHECKPOINT_BASE_DIR"
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/root/.cache/openpi}"
+export MUSA_VISIBLE_DEVICES="${MUSA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export GR00T_DIST_BACKEND="${GR00T_DIST_BACKEND:-mccl}"
+RESUME_ARGS=()
+if [[ "${RESUME:-0}" == "1" ]]; then RESUME_ARGS+=(--resume); fi
+cd "$PROJECT_ROOT"
+echo "[preflight] host=$(hostname) node_rank=$NODE_RANK nnodes=$NNODES nproc=$NPROC_PER_NODE master=$MASTER_ADDR:$MASTER_PORT"
+python -c 'import torch, torch_musa; print(f"[preflight] torch={torch.__version__} musa={torch.musa.device_count()}")'
+test -f "$WEIGHT_PATH/model.safetensors"
+test -f "$ASSETS_DIR/$ASSET_ID/norm_stats.json"
+exec torchrun --nnodes "$NNODES" --nproc_per_node "$NPROC_PER_NODE" --node_rank "$NODE_RANK" --master_addr "$MASTER_ADDR" --master_port "$MASTER_PORT" "$PROJECT_ROOT/scripts/train_pytorch.py" pi05_libero --exp-name "$EXP_NAME" --pytorch-weight-path "$WEIGHT_PATH" --data.repo-id "$DATASET" --data.assets.assets-dir "$ASSETS_DIR" --data.assets.asset-id "$ASSET_ID" --batch-size "$BATCH_SIZE" --num-workers "${NUM_WORKERS:-0}" --num-train-steps "$NUM_TRAIN_STEPS" --log-interval "$LOG_INTERVAL" --save-interval "$SAVE_INTERVAL" --checkpoint-base-dir "$CHECKPOINT_BASE_DIR" --no-wandb-enabled "${RESUME_ARGS[@]}"
